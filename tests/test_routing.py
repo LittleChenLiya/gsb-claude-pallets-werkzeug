@@ -1905,3 +1905,251 @@ def test_bind_untrusted_host() -> None:
 
     with pytest.raises(SecurityError):
         r.Map().bind_to_environ(req)
+
+
+# ---------------------------------------------------------------------------
+# MapAdapter.build_diagnostic
+# ---------------------------------------------------------------------------
+
+
+def test_build_diagnostic_missing_values_then_success():
+    """The same endpoint has an ``int:id`` rule and a ``string:slug`` rule.
+    Passing ``slug`` explains that the first rule is missing ``id`` and the
+    second rule succeeds.
+    """
+    m = r.Map(
+        [
+            r.Rule("/<int:id>", endpoint="x"),
+            r.Rule("/<slug>", endpoint="x"),
+        ]
+    )
+    adapter = m.bind("example.com")
+    diagnostic = adapter.build_diagnostic("x", {"slug": "foo"})
+
+    assert diagnostic.ok
+    assert diagnostic.url == "/foo"
+    assert len(diagnostic.candidates) == 2
+
+    first, second = diagnostic.candidates
+    assert first.reason == "missing"
+    assert first.missing == {"id"}
+    assert not first.selected
+    assert second.reason is None
+    assert second.path == "/foo"
+    assert second.selected
+
+
+def test_build_diagnostic_method_rejection():
+    """Specifying an unsupported method lists the method rejection."""
+    m = r.Map(
+        [
+            r.Rule("/<int:id>", endpoint="x"),
+            r.Rule("/<slug>", endpoint="x", methods=["GET"]),
+        ]
+    )
+    adapter = m.bind("example.com")
+    diagnostic = adapter.build_diagnostic("x", {"slug": "foo"}, method="POST")
+
+    assert not diagnostic.ok
+    assert isinstance(diagnostic.error, r.BuildError)
+
+    first, second = diagnostic.candidates
+    assert first.reason == "missing"
+    assert first.missing == {"id"}
+    assert second.reason == "method"
+    assert second.method == "POST"
+    assert not second.selected
+
+
+def test_build_diagnostic_converter_rejection():
+    """A converter that rejects the value is reported with its reason."""
+    m = r.Map([r.Rule("/<int:id>", endpoint="x")])
+    adapter = m.bind("example.com")
+    diagnostic = adapter.build_diagnostic("x", {"id": -5})
+
+    assert not diagnostic.ok
+    candidate = diagnostic.candidates[0]
+    assert candidate.reason == "converter"
+    assert candidate.converter == "id"
+    assert "Negative" in candidate.converter_error
+
+
+def test_build_diagnostic_converter_call_count():
+    """Converters may have side effects. A converter is invoked at most once
+    per rule and the result is cached for the report.
+    """
+
+    class CountingConverter(r.BaseConverter):
+        calls = 0
+
+        def to_url(self, value: t.Any) -> str:
+            CountingConverter.calls += 1
+            if value == "bad":
+                raise r.ValidationError("rejected")
+            return super().to_url(value)
+
+    m = r.Map(
+        [
+            r.Rule("/<count:id>", endpoint="x"),
+            r.Rule("/<slug>", endpoint="x"),
+        ],
+        converters={"count": CountingConverter},
+    )
+    adapter = m.bind("example.com")
+
+    CountingConverter.calls = 0
+    diagnostic = adapter.build_diagnostic("x", {"id": 1})
+    assert diagnostic.ok
+    assert CountingConverter.calls == 1
+    # Generating the report must not invoke the converter again.
+    str(diagnostic)
+    assert CountingConverter.calls == 1
+
+    CountingConverter.calls = 0
+    diagnostic = adapter.build_diagnostic("x", {"id": "bad"})
+    assert not diagnostic.ok
+    assert CountingConverter.calls == 1
+    str(diagnostic)
+    assert CountingConverter.calls == 1
+
+
+def test_build_diagnostic_defaults():
+    """Default parameters are handled: building with and without the default,
+    and providing a value that differs from the default.
+    """
+    m = r.Map(
+        [
+            r.Rule("/all/", defaults={"page": 1}, endpoint="p"),
+            r.Rule("/all/page/<int:page>", endpoint="p"),
+        ]
+    )
+    adapter = m.bind("example.com")
+
+    # No values: the default rule builds /all/.
+    diagnostic = adapter.build_diagnostic("p", {})
+    assert diagnostic.ok
+    assert diagnostic.url == "/all/"
+    assert diagnostic.candidates[0].selected
+
+    # Value matches the default: the default rule is still selected.
+    diagnostic = adapter.build_diagnostic("p", {"page": 1})
+    assert diagnostic.ok
+    assert diagnostic.url == "/all/"
+    assert diagnostic.candidates[0].selected
+
+    # Value differs from the default: the default rule is unsuitable and the
+    # page rule is selected.
+    diagnostic = adapter.build_diagnostic("p", {"page": 5})
+    assert diagnostic.ok
+    assert diagnostic.url == "/all/page/5"
+    assert diagnostic.candidates[0].reason == "defaults"
+    assert diagnostic.candidates[1].selected
+
+
+def test_build_diagnostic_host_matching():
+    """Host rules are included as candidate constraints."""
+    m = r.Map(
+        [
+            r.Rule("/", endpoint="i", host="a.example.com"),
+            r.Rule("/", endpoint="i", host="b.example.com"),
+        ],
+        host_matching=True,
+    )
+
+    # Bound to a matching host: the matching rule is selected and the other
+    # rule is not considered.
+    adapter = m.bind("a.example.com")
+    diagnostic = adapter.build_diagnostic("i", {})
+    assert diagnostic.ok
+    assert diagnostic.url == "/"
+    assert diagnostic.candidates[0].selected
+    assert diagnostic.candidates[0].host_match is True
+
+    # Bound to a host that no rule matches: the first rule is used as a
+    # fallback and the URL is external. Both candidates are analyzed.
+    adapter = m.bind("c.example.com")
+    diagnostic = adapter.build_diagnostic("i", {})
+    assert diagnostic.ok
+    assert diagnostic.url == "http://a.example.com/"
+    assert len(diagnostic.candidates) == 2
+    first, second = diagnostic.candidates
+    assert first.host_match is False
+    assert first.selected
+    assert second.host_match is False
+    assert not second.selected
+
+
+def test_build_diagnostic_subdomain_matching():
+    """Subdomain rules are included as candidate constraints."""
+    m = r.Map(
+        [
+            r.Rule("/<slug>", endpoint="i"),
+            r.Rule("/", subdomain="kb", endpoint="i"),
+        ],
+        subdomain_matching=True,
+    )
+    adapter = m.bind("example.com")
+    diagnostic = adapter.build_diagnostic("i", {})
+
+    assert diagnostic.ok
+    assert diagnostic.url == "http://kb.example.com/"
+    first, second = diagnostic.candidates
+    assert first.reason == "missing"
+    assert first.missing == {"slug"}
+    assert second.selected
+    assert second.subdomain_match is False
+
+
+def test_build_diagnostic_build_error_compat():
+    """The diagnostic's BuildError is compatible with the BuildError that
+    :meth:`MapAdapter.build` raises.
+    """
+    m = r.Map([r.Rule("/<int:id>", endpoint="x")])
+    adapter = m.bind("example.com")
+
+    with pytest.raises(r.BuildError) as excinfo:
+        adapter.build("x", {"id": -5})
+    build_error = excinfo.value
+
+    diagnostic = adapter.build_diagnostic("x", {"id": -5})
+    assert not diagnostic.ok
+    assert isinstance(diagnostic.error, r.BuildError)
+    assert type(diagnostic.error) is type(build_error)
+    assert diagnostic.error.endpoint == build_error.endpoint
+    assert diagnostic.error.values == build_error.values
+    assert diagnostic.error.method == build_error.method
+    assert str(diagnostic.error) == str(build_error)
+
+
+def test_build_diagnostic_missing_endpoint():
+    """An endpoint with no rules reports no candidates."""
+    m = r.Map([r.Rule("/", endpoint="x")])
+    adapter = m.bind("example.com")
+    diagnostic = adapter.build_diagnostic("missing", {})
+
+    assert not diagnostic.ok
+    assert diagnostic.candidates == []
+    assert isinstance(diagnostic.error, r.BuildError)
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "values"),
+    [
+        ("x", {"slug": "foo"}),
+        ("x", {"id": 1}),
+        ("x", {"id": 1, "q": "v"}),
+        ("x", MultiDict([("id", 1), ("q", "v")])),
+    ],
+)
+def test_build_diagnostic_matches_build_url(endpoint, values):
+    """On success the diagnostic URL matches the normal build URL."""
+    m = r.Map(
+        [
+            r.Rule("/<int:id>", endpoint="x"),
+            r.Rule("/<slug>", endpoint="x"),
+        ]
+    )
+    adapter = m.bind("example.com")
+    assert adapter.build_diagnostic(endpoint, values).url == adapter.build(
+        endpoint, values
+    )

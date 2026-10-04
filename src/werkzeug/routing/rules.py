@@ -296,6 +296,49 @@ class RuleTemplateFactory(RuleFactory):
 _ASTT = t.TypeVar("_ASTT", bound=ast.AST)
 
 
+class _RecordingConverter:
+    """Wrap a converter so that the first :meth:`to_url` rejection is recorded.
+
+    The wrapped converter's ``to_url`` is invoked at most once. All other
+    attribute access is delegated to the wrapped converter.
+
+    :internal:
+    """
+
+    def __init__(
+        self,
+        name: str,
+        converter: BaseConverter,
+        record: dict[str, Exception],
+    ) -> None:
+        self._name = name
+        self._converter = converter
+        self._record = record
+
+    def to_url(self, value: t.Any) -> str:
+        try:
+            return self._converter.to_url(value)
+        except Exception as e:
+            self._record[self._name] = e
+            raise
+
+    def __getattr__(self, item: str) -> t.Any:
+        return getattr(self._converter, item)
+
+
+class _BuildSelf:
+    """Stand-in for a :class:`Rule` when invoking the compiled builder with
+    recording converters. The generated builder only accesses
+    ``_converters`` and ``_encode_query_vars`` on ``self``.
+
+    :internal:
+    """
+
+    def __init__(self, rule: Rule, converters: dict[str, _RecordingConverter]) -> None:
+        self._converters = converters
+        self._encode_query_vars = rule._encode_query_vars
+
+
 def _prefix_names(src: str, expected_type: type[_ASTT]) -> _ASTT:
     """ast parse and prefix names with `.` to avoid collision with user vars"""
     tree: ast.AST = ast.parse(src).body[0]
@@ -851,6 +894,44 @@ class Rule(RuleFactory):
                 return self._build(**values)
         except ValidationError:
             return None
+
+    def build_diagnostic(
+        self, values: t.Mapping[str, t.Any], append_unknown: bool = True
+    ) -> tuple[str | None, str | None, tuple[str, Exception] | None]:
+        """Build the URL while recording which converter rejected a value.
+
+        Returns ``(domain_part, path, None)`` on success or
+        ``(None, None, (converter_name, exception))`` if a converter
+        rejected the value. Each converter's ``to_url`` is invoked at most
+        once, the result is cached, and no converter is called again to
+        produce the report.
+
+        :internal:
+        """
+        record: dict[str, Exception] = {}
+        converters = {
+            name: _RecordingConverter(name, converter, record)
+            for name, converter in self._converters.items()
+        }
+        builder_self = _BuildSelf(self, converters)
+        builder = self._build_unknown if append_unknown else self._build
+        # Invoke the compiled builder with the recording stand-in as ``self``.
+        # ``__func__`` is the underlying function expecting ``self`` first.
+        builder_func = t.cast(t.Any, builder).__func__
+
+        try:
+            rv = builder_func(builder_self, **values)
+        except ValidationError:
+            rv = None
+
+        if rv is None:
+            if record:
+                name, exc = next(iter(record.items()))
+                return None, None, (name, exc)
+
+            return None, None, None
+
+        return rv[0], rv[1], None
 
     def provides_defaults_for(self, rule: Rule) -> bool:
         """Check if this rule has defaults for a given rule.

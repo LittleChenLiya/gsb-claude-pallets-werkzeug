@@ -3,6 +3,8 @@ from __future__ import annotations
 import collections.abc as cabc
 import typing as t
 import warnings
+from dataclasses import dataclass
+from dataclasses import field
 from pprint import pformat
 from threading import Lock
 from urllib.parse import quote
@@ -35,6 +37,31 @@ if t.TYPE_CHECKING:
     from _typeshed.wsgi import WSGIEnvironment
 
     from .rules import RuleFactory
+
+
+def _prepare_build_values(
+    values: t.Mapping[str, t.Any] | None,
+) -> dict[str, t.Any]:
+    """Normalize the ``values`` argument passed to build methods.
+
+    Drop ``None`` values, unwrap single-item ``MultiDict`` values, and drop
+    empty lists. Shared by :meth:`MapAdapter.build` and
+    :meth:`MapAdapter.build_diagnostic` so both see the same values.
+    """
+    if values:
+        if isinstance(values, MultiDict):
+            return {
+                k: (v[0] if len(v) == 1 else v)
+                for k, v in dict.items(values)
+                if len(v) != 0
+            }
+        return {k: v for k, v in values.items() if v is not None}
+    return {}
+
+
+#: The result of :meth:`Rule.build_diagnostic`: ``(domain_part, path, None)``
+#: on success or ``(None, None, (converter_name, exception))`` on rejection.
+_BuildDiagnosticResult = tuple[str | None, str | None, tuple[str, Exception] | None]
 
 
 class Map:
@@ -426,6 +453,149 @@ def _get_wsgi_string(env: WSGIEnvironment, name: str) -> str | None:
         return _wsgi_decoding_dance(val)
 
     return None
+
+
+@dataclass
+class BuildCandidate:
+    """The analysis of a single :class:`.Rule` during a
+    :meth:`MapAdapter.build_diagnostic` attempt.
+
+    :param rule: The rule that was analyzed.
+    :param phase: Which selection phase produced this candidate. ``"default"``
+        is the first phase using the adapter's default method, ``"fallback"``
+        is the second phase with no method restriction, and ``"explicit"`` is
+        the single phase when a method was passed explicitly.
+    :param method: The method constraint applied to this candidate. ``None``
+        means no method restriction.
+    :param reason: Why the candidate was not selected. ``None`` if it built
+        successfully, otherwise one of ``"method"``, ``"missing"``,
+        ``"defaults"``, or ``"converter"``.
+    :param missing: Values required by the rule that were not provided.
+    :param defaults_mismatch: Default values that differ from the provided
+        values, as ``(name, default, value)`` tuples.
+    :param converter: The name of the converter that rejected the value.
+    :param converter_error: The converter's rejection message.
+    :param domain_part: The built subdomain or host, if building succeeded.
+    :param path: The built path, if building succeeded.
+    :param host_matching: Whether the map uses host matching.
+    :param subdomain_matching: Whether the map uses subdomain matching.
+    :param host_match: Whether the built host matches the adapter's host.
+        Only set for host matching.
+    :param subdomain_match: Whether the built subdomain matches the adapter's
+        subdomain.
+    :param selected: Whether this candidate produced the selected URL.
+    """
+
+    rule: Rule
+    phase: str
+    method: str | None
+    reason: str | None = None
+    missing: set[str] = field(default_factory=set)
+    defaults_mismatch: list[tuple[str, t.Any, t.Any]] = field(default_factory=list)
+    converter: str | None = None
+    converter_error: str | None = None
+    domain_part: str | None = None
+    path: str | None = None
+    host_matching: bool = False
+    subdomain_matching: bool = False
+    host_match: bool | None = None
+    subdomain_match: bool = False
+    selected: bool = False
+
+    @property
+    def success(self) -> bool:
+        """Whether the rule built successfully."""
+        return self.reason is None and self.domain_part is not None
+
+    def __str__(self) -> str:
+        heading = repr(self.rule)
+
+        if self.phase != "explicit":
+            heading = f"[{self.phase}] {heading}"
+
+        if self.method is not None:
+            heading = f"{heading} (method={self.method!r})"
+
+        lines = [heading]
+
+        if self.reason == "method":
+            if self.rule.methods is None:
+                allowed = "any"
+            else:
+                allowed = f"{sorted(self.rule.methods)!r}"
+
+            lines.append(
+                f"  not suitable: method {self.method!r} not allowed"
+                f" (allowed: {allowed})"
+            )
+        elif self.reason == "missing":
+            lines.append(f"  not suitable: missing values {sorted(self.missing)!r}")
+        elif self.reason == "defaults":
+            mismatch = ", ".join(
+                f"{name!r}: default {default!r} != value {value!r}"
+                for name, default, value in self.defaults_mismatch
+            )
+            lines.append(f"  not suitable: defaults mismatch ({mismatch})")
+        elif self.reason == "converter":
+            lines.append(
+                f"  converter {self.converter!r} rejected: {self.converter_error!r}"
+            )
+        else:
+            lines.append(f"  built path {self.path!r}")
+
+            if self.host_matching:
+                status = "matches" if self.host_match else "does not match"
+                lines.append(f"  host {self.domain_part!r} {status}")
+
+            if self.subdomain_matching and self.domain_part:
+                status = "matches" if self.subdomain_match else "does not match"
+                lines.append(f"  subdomain {self.domain_part!r} {status}")
+
+        if self.selected:
+            lines.append("  selected")
+
+        return "\n".join(lines)
+
+
+@dataclass
+class BuildDiagnostic:
+    """The result of :meth:`MapAdapter.build_diagnostic`.
+
+    :param endpoint: The endpoint that was requested.
+    :param values: The normalized values that were used.
+    :param method: The method that was requested.
+    :param ok: Whether a URL could be built.
+    :param url: The built URL, or ``None`` if building failed.
+    :param candidates: All candidates that were analyzed, in selection order.
+    :param error: A :exc:`.BuildError` compatible with the one
+        :meth:`MapAdapter.build` would raise, or ``None`` on success.
+    """
+
+    endpoint: t.Any
+    values: t.Mapping[str, t.Any]
+    method: str | None
+    ok: bool
+    url: str | None
+    candidates: list[BuildCandidate]
+    error: BuildError | None
+
+    def __str__(self) -> str:
+        lines = [
+            f"Build diagnostic for endpoint {self.endpoint!r}"
+            f" with values {sorted(self.values)!r}"
+            + (f" and method {self.method!r}" if self.method else "")
+            + ":"
+        ]
+
+        for index, candidate in enumerate(self.candidates, 1):
+            lines.append(f"  [{index}] {candidate}")
+
+        if self.ok:
+            lines.append(f"Result: built URL {self.url!r}")
+        else:
+            lines.append(f"Result: failed with {self.error!s}")
+
+        return "\n".join(lines)
 
 
 class MapAdapter:
@@ -937,24 +1107,30 @@ class MapAdapter:
            Added the ``append_unknown`` parameter.
         """
         self.map.update()
-
-        if values:
-            if isinstance(values, MultiDict):
-                values = {
-                    k: (v[0] if len(v) == 1 else v)
-                    for k, v in dict.items(values)
-                    if len(v) != 0
-                }
-            else:  # plain dict
-                values = {k: v for k, v in values.items() if v is not None}
-        else:
-            values = {}
+        values = _prepare_build_values(values)
 
         rv = self._partial_build(endpoint, values, method, append_unknown)
         if rv is None:
             raise BuildError(endpoint, values, method, self)
 
         domain_part, path, websocket = rv
+        return self._make_url(domain_part, path, websocket, force_external, url_scheme)
+
+    def _make_url(
+        self,
+        domain_part: str,
+        path: str,
+        websocket: bool,
+        force_external: bool,
+        url_scheme: str | None,
+    ) -> str:
+        """Build the final URL from the selected rule's domain and path.
+
+        Shared by :meth:`build` and :meth:`build_diagnostic` so both produce
+        the same URL.
+
+        :internal:
+        """
         host = self.get_host(domain_part)
 
         if url_scheme is None:
@@ -982,3 +1158,240 @@ class MapAdapter:
 
         scheme = f"{url_scheme}:" if url_scheme else ""
         return f"{scheme}//{host}{self.script_name[:-1]}/{path.lstrip('/')}"
+
+    def build_diagnostic(
+        self,
+        endpoint: t.Any,
+        values: t.Mapping[str, t.Any] | None = None,
+        method: str | None = None,
+        append_unknown: bool = True,
+        force_external: bool = False,
+        url_scheme: str | None = None,
+    ) -> BuildDiagnostic:
+        """Diagnose why a URL could not be built for an endpoint.
+
+        Works like :meth:`build` but instead of raising :exc:`.BuildError` when
+        no rule matches, it returns a :class:`BuildDiagnostic` describing every
+        candidate rule in the order :class:`MapAdapter` actually selects them.
+        For each candidate it reports whether the endpoint matched, whether the
+        method was allowed, which values were missing, and which converter
+        rejected a value. Host and subdomain are included as candidate
+        constraints.
+
+        Converters may have side effects, so each candidate's converters are
+        invoked at most once and the result is cached; the report reuses the
+        cached result and never runs a converter again. On success the URL is
+        identical to what :meth:`build` would produce.
+
+        :param endpoint: The endpoint for the rule to build.
+        :param values: Values for the variable parts of the rule.
+        :param method: Further match the rule to build by this HTTP method.
+        :param append_unknown: Convert values that don't match any rule parts
+            to a query string. Disable to ignore such values.
+        :param force_external: Always produce an absolute URL.
+        :param url_scheme: Scheme to use for absolute URLs. Defaults to
+            :attr:`url_scheme`.
+
+        .. versionadded:: 3.2
+        """
+        self.map.update()
+        values = _prepare_build_values(values)
+
+        rv, candidates = self._partial_build_diagnostic(
+            endpoint, values, method, append_unknown
+        )
+
+        if rv is None:
+            error = BuildError(endpoint, values, method, self)
+            return BuildDiagnostic(
+                endpoint=endpoint,
+                values=values,
+                method=method,
+                ok=False,
+                url=None,
+                candidates=candidates,
+                error=error,
+            )
+
+        domain_part, path, websocket = rv
+        url = self._make_url(domain_part, path, websocket, force_external, url_scheme)
+        return BuildDiagnostic(
+            endpoint=endpoint,
+            values=values,
+            method=method,
+            ok=True,
+            url=url,
+            candidates=candidates,
+            error=None,
+        )
+
+    def _partial_build_diagnostic(
+        self,
+        endpoint: t.Any,
+        values: t.Mapping[str, t.Any],
+        method: str | None,
+        append_unknown: bool,
+    ) -> tuple[tuple[str, str, bool] | None, list[BuildCandidate]]:
+        """Like :meth:`_partial_build` but records every candidate that was
+        analyzed and why it was or wasn't selected.
+
+        Converters may have side effects, so each rule's converters are invoked
+        at most once and the result is cached across the whole diagnostic,
+        including the second selection phase.
+
+        :internal:
+        """
+        candidates: list[BuildCandidate] = []
+        build_cache: dict[int, _BuildDiagnosticResult] = {}
+
+        # In case the method is none, try with the default method first.
+        if method is None:
+            rv, default_candidates = self._build_phase_diagnostic(
+                endpoint,
+                values,
+                self.default_method,
+                append_unknown,
+                "default",
+                build_cache,
+            )
+            candidates.extend(default_candidates)
+
+            if rv is not None:
+                return rv, candidates
+
+            # Default method did not match. Check all rules with no method
+            # restriction.
+            rv, fallback_candidates = self._build_phase_diagnostic(
+                endpoint, values, None, append_unknown, "fallback", build_cache
+            )
+            candidates.extend(fallback_candidates)
+            return rv, candidates
+
+        rv, explicit_candidates = self._build_phase_diagnostic(
+            endpoint, values, method, append_unknown, "explicit", build_cache
+        )
+        candidates.extend(explicit_candidates)
+        return rv, candidates
+
+    def _build_phase_diagnostic(
+        self,
+        endpoint: t.Any,
+        values: t.Mapping[str, t.Any],
+        method: str | None,
+        append_unknown: bool,
+        phase: str,
+        build_cache: dict[int, _BuildDiagnosticResult],
+    ) -> tuple[tuple[str, str, bool] | None, list[BuildCandidate]]:
+        """Analyze all rules for one method constraint.
+
+        Mirrors the selection logic of :meth:`_partial_build` for a single
+        pass. Returns the selected ``(domain_part, path, websocket)`` tuple (or
+        the first host match as a fallback) and the candidates in selection
+        order.
+
+        :internal:
+        """
+        first_match: tuple[str, str, bool] | None = None
+        first_match_candidate: BuildCandidate | None = None
+        candidates: list[BuildCandidate] = []
+
+        for rule in self.map._rules_by_endpoint.get(endpoint, ()):
+            candidate = self._analyze_rule(
+                rule, values, method, append_unknown, phase, build_cache
+            )
+            candidates.append(candidate)
+
+            if candidate.domain_part is None or candidate.path is None:
+                continue
+
+            rv = (candidate.domain_part, candidate.path, rule.websocket)
+
+            if self.map.host_matching:
+                if rv[0] == self.server_name:
+                    candidate.selected = True
+                    return rv, candidates
+                elif first_match is None:
+                    first_match = rv
+                    first_match_candidate = candidate
+            else:
+                candidate.selected = True
+                return rv, candidates
+
+        if first_match_candidate is not None:
+            first_match_candidate.selected = True
+
+        return first_match, candidates
+
+    def _analyze_rule(
+        self,
+        rule: Rule,
+        values: t.Mapping[str, t.Any],
+        method: str | None,
+        append_unknown: bool,
+        phase: str,
+        build_cache: dict[int, _BuildDiagnosticResult],
+    ) -> BuildCandidate:
+        """Analyze a single rule: method restriction, missing values, defaults,
+        and converter rejection.
+
+        :internal:
+        """
+        candidate = BuildCandidate(rule=rule, phase=phase, method=method)
+        candidate.host_matching = self.map.host_matching
+        candidate.subdomain_matching = self.map.subdomain_matching
+
+        # Method restriction (mirrors Rule.suitable_for).
+        if (
+            method is not None
+            and rule.methods is not None
+            and method not in rule.methods
+        ):
+            candidate.reason = "method"
+            return candidate
+
+        defaults = rule.defaults or ()
+
+        # All required arguments must be provided or have a default.
+        missing = {
+            key for key in rule.arguments if key not in defaults and key not in values
+        }
+        if missing:
+            candidate.reason = "missing"
+            candidate.missing = missing
+            return candidate
+
+        # Provided defaults must match the default value.
+        if defaults:
+            mismatch = [
+                (key, defaults[key], values[key])
+                for key in defaults
+                if key in values and values[key] != defaults[key]
+            ]
+            if mismatch:
+                candidate.reason = "defaults"
+                candidate.defaults_mismatch = mismatch
+                return candidate
+
+        # The rule is suitable. Build exactly once, recording which converter
+        # rejected the value. The result is cached per rule so each converter
+        # is invoked at most once, even across the fallback selection phase.
+        cache_key = id(rule)
+        if cache_key in build_cache:
+            rv = build_cache[cache_key]
+        else:
+            rv = rule.build_diagnostic(values, append_unknown)
+            build_cache[cache_key] = rv
+
+        if rv[2] is not None:
+            candidate.reason = "converter"
+            candidate.converter = rv[2][0]
+            candidate.converter_error = str(rv[2][1]) or type(rv[2][1]).__name__
+            return candidate
+
+        candidate.domain_part = rv[0]
+        candidate.path = rv[1]
+        candidate.host_match = (
+            (rv[0] == self.server_name) if self.map.host_matching else None
+        )
+        candidate.subdomain_match = rv[0] == self.subdomain
+        return candidate
