@@ -9,6 +9,12 @@ Version 3.2.0
     -   ``OrderedMultiDict`` and ``ImmutableOrderedMultiDict`` are removed.
         The base ``MultiDict`` already retains order.
 
+-   Add ``MapAdapter.build_diagnostics``, a read-only entry point that
+    explains why building a URL fails. It reports, for each candidate
+    rule in the order ``build`` considers them, method restrictions,
+    missing arguments, defaults mismatches, converter rejections, and
+    host or subdomain constraints, without changing ``build`` or
+    ``BuildError`` behavior.
 -   Minimum required version of MarkupSafe is 3.0.3.
 -   Minimum supported version of Watchdog is 6.0.
 -   The CSP ``prefetch_src``, ``navigate_to``, and ``plugin_types`` properties

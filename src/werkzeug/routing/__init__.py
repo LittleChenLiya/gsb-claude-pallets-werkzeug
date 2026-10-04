@@ -114,6 +114,8 @@ from .converters import PathConverter as PathConverter
 from .converters import UnicodeConverter as UnicodeConverter
 from .converters import UUIDConverter as UUIDConverter
 from .converters import ValidationError as ValidationError
+from .diagnostics import BuildCandidate as BuildCandidate
+from .diagnostics import BuildDiagnostics as BuildDiagnostics
 from .exceptions import BuildError as BuildError
 from .exceptions import NoMatch as NoMatch
 from .exceptions import RequestAliasRedirect as RequestAliasRedirect

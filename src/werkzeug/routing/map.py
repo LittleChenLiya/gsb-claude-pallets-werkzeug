@@ -20,6 +20,8 @@ from ..wrappers.request import Request
 from ..wsgi import get_host
 from . import converters
 from .converters import BaseConverter
+from .diagnostics import BuildCandidate
+from .diagnostics import BuildDiagnostics
 from .exceptions import BuildError
 from .exceptions import NoMatch
 from .exceptions import RequestAliasRedirect
@@ -954,6 +956,18 @@ class MapAdapter:
         if rv is None:
             raise BuildError(endpoint, values, method, self)
 
+        return self._build_url(rv, force_external, url_scheme)
+
+    def _build_url(
+        self,
+        rv: tuple[str, str, bool],
+        force_external: bool,
+        url_scheme: str | None,
+    ) -> str:
+        """Assemble the final URL from the selected rule parts.
+
+        :internal:
+        """
         domain_part, path, websocket = rv
         host = self.get_host(domain_part)
 
@@ -982,3 +996,286 @@ class MapAdapter:
 
         scheme = f"{url_scheme}:" if url_scheme else ""
         return f"{scheme}//{host}{self.script_name[:-1]}/{path.lstrip('/')}"
+
+    def build_diagnostics(
+        self,
+        endpoint: t.Any,
+        values: t.Mapping[str, t.Any] | None = None,
+        method: str | None = None,
+        force_external: bool = False,
+        append_unknown: bool = True,
+        url_scheme: str | None = None,
+    ) -> BuildDiagnostics:
+        """Analyze how :meth:`build` would handle the given arguments and
+        return a read-only :class:`.BuildDiagnostics` report instead of
+        raising :class:`.BuildError`.
+
+        Each rule for the endpoint is evaluated in the same order
+        :meth:`build` would consider it, recording why it was rejected:
+        an unsupported method, missing values, values conflicting with
+        the rule's defaults, or a converter rejecting a value. Host and
+        subdomain constraints are reported as well. If a rule is
+        selected, :attr:`~.BuildDiagnostics.url` is identical to what
+        :meth:`build` would return.
+
+        Converters may have side effects, therefore each converter is
+        called at most once per candidate rule during the analysis and
+        the result is cached; rendering the report does not call
+        converters again. Normal builds are not affected in any way.
+
+        .. code-block:: python
+
+            m = Map([
+                Rule("/user/<int:id>", endpoint="show"),
+                Rule("/user/<string:slug>", endpoint="show"),
+            ])
+            a = m.bind("example.com")
+            print(a.build_diagnostics("show", {"slug": "abc"}).explain())
+
+        :param endpoint: The endpoint to build a URL for.
+        :param values: Values for the variable parts of the rule.
+        :param method: Further match rules by this HTTP method.
+        :param force_external: Analyze building an absolute URL.
+        :param append_unknown: Convert extra values to a query string.
+        :param url_scheme: Scheme to use for absolute URLs.
+
+        .. versionadded:: 3.2
+        """
+        self.map.update()
+
+        if values:
+            if isinstance(values, MultiDict):
+                values = {
+                    k: (v[0] if len(v) == 1 else v)
+                    for k, v in dict.items(values)
+                    if len(v) != 0
+                }
+            else:  # plain dict
+                values = {k: v for k, v in values.items() if v is not None}
+        else:
+            values = {}
+
+        # Caches (rule, argument) -> (ok, converted value or exception)
+        # so a converter with side effects is called at most once per
+        # candidate, even if a second pass without a method is needed.
+        converter_cache: dict[tuple[int, str], tuple[bool, t.Any]] = {}
+        candidates: list[BuildCandidate] = []
+
+        if method is None:
+            # Mirror `_partial_build`, which tries the default method
+            # first and falls back to no method restriction.
+            pass_methods: list[str | None] = [self.default_method, None]
+        else:
+            pass_methods = [method]
+
+        rv: tuple[str, str, bool] | None = None
+        skip: set[int] = set()
+
+        for pass_method in pass_methods:
+            rv = self._diagnose_partial_build(
+                endpoint,
+                values,
+                pass_method,
+                append_unknown,
+                candidates,
+                converter_cache,
+                skip,
+            )
+
+            if rv is not None:
+                break
+
+            # The next pass only differs by not restricting the method.
+            # Rules rejected for other reasons would fail identically,
+            # don't evaluate (or call converters for) them again.
+            skip = {
+                id(candidate.rule)
+                for candidate in candidates
+                if not candidate.accepted and candidate.allowed_methods is None
+            }
+
+        url = None if rv is None else self._build_url(rv, force_external, url_scheme)
+
+        return BuildDiagnostics(
+            endpoint=endpoint,
+            values=values,
+            method=method,
+            candidates=candidates,
+            url=url,
+        )
+
+    def _diagnose_partial_build(
+        self,
+        endpoint: t.Any,
+        values: t.Mapping[str, t.Any],
+        method: str | None,
+        append_unknown: bool,
+        candidates: list[BuildCandidate],
+        converter_cache: dict[tuple[int, str], tuple[bool, t.Any]],
+        skip: set[int],
+    ) -> tuple[str, str, bool] | None:
+        """Like :meth:`_partial_build`, but records a
+        :class:`.BuildCandidate` for every rule that is evaluated.
+
+        :internal:
+        """
+        first_match: tuple[tuple[str, str, bool], BuildCandidate] | None = None
+
+        for rule in self.map._rules_by_endpoint.get(endpoint, ()):
+            if id(rule) in skip:
+                continue
+            candidate, build_rv = self._diagnose_rule_build(
+                rule, values, method, append_unknown, converter_cache
+            )
+            candidates.append(candidate)
+
+            if build_rv is None:
+                continue
+
+            rv = (build_rv[0], build_rv[1], rule.websocket)
+
+            if self.map.host_matching:
+                if rv[0] == self.server_name:
+                    candidate.selected = True
+                    return rv
+                elif first_match is None:
+                    first_match = (rv, candidate)
+            else:
+                candidate.selected = True
+                return rv
+
+        if first_match is not None:
+            rv, candidate = first_match
+            candidate.selected = True
+            candidate.fallback = True
+            return rv
+
+        return None
+
+    def _diagnose_rule_build(
+        self,
+        rule: Rule,
+        values: t.Mapping[str, t.Any],
+        method: str | None,
+        append_unknown: bool,
+        converter_cache: dict[tuple[int, str], tuple[bool, t.Any]],
+    ) -> tuple[BuildCandidate, tuple[str, str] | None]:
+        """Evaluate a single rule like ``suitable_for`` and ``build``
+        would, collecting the reasons if it is rejected.
+
+        :internal:
+        """
+        candidate = BuildCandidate(rule=rule, method=method)
+        reasons = candidate.reasons
+        defaults = rule.defaults or {}
+
+        if (
+            method is not None
+            and rule.methods is not None
+            and method not in rule.methods
+        ):
+            candidate.allowed_methods = tuple(sorted(rule.methods))
+            reasons.append(
+                f"method {method!r} is not allowed by the rule,"
+                f" allowed methods: {sorted(rule.methods)!r}"
+            )
+
+        for key in rule.arguments:
+            if key not in defaults and key not in values:
+                candidate.missing_arguments.append(key)
+
+        for key in sorted(candidate.missing_arguments):
+            reasons.append(f"missing value for argument {key!r}")
+
+        for key, default_value in defaults.items():
+            if key in values and values[key] != default_value:
+                candidate.mismatched_defaults[key] = (values[key], default_value)
+                reasons.append(
+                    f"value {values[key]!r} for argument {key!r} does not"
+                    f" match the rule default {default_value!r}"
+                )
+
+        build_rv: tuple[str, str] | None = None
+
+        if not reasons:
+            build_rv, errors = self._convert_rule_parts(
+                rule, values, append_unknown, converter_cache
+            )
+
+            for key, (raw, exc) in errors.items():
+                converter = rule._converters[key]
+                candidate.converter_errors[key] = str(exc) or type(exc).__name__
+                reasons.append(
+                    f"converter {type(converter).__name__} rejected value"
+                    f" {raw!r} for argument {key!r}: {exc}"
+                )
+
+            if build_rv is not None:
+                candidate.domain, candidate.path = build_rv
+                candidate.host_mismatch = bool(
+                    self.map.host_matching and candidate.domain != self.server_name
+                )
+
+        return candidate, build_rv
+
+    def _convert_rule_parts(
+        self,
+        rule: Rule,
+        values: t.Mapping[str, t.Any],
+        append_unknown: bool,
+        converter_cache: dict[tuple[int, str], tuple[bool, t.Any]],
+    ) -> tuple[tuple[str, str] | None, dict[str, tuple[t.Any, BaseException]]]:
+        """Assemble the domain and path for a rule, replicating
+        ``Rule._compile_builder``. Each converter is called at most once
+        per rule and diagnostics run, the result is cached in
+        ``converter_cache``.
+
+        :internal:
+        """
+        defaults = rule.defaults or {}
+        dom_parts: list[str] = []
+        url_parts: list[str] = []
+        parts = dom_parts
+        errors: dict[str, tuple[t.Any, BaseException]] = {}
+
+        for is_dynamic, data in rule._trace:
+            if data == "|" and parts is dom_parts:
+                parts = url_parts
+                continue
+
+            if is_dynamic:
+                raw = defaults[data] if data in defaults else values[data]
+                cache_key = (id(rule), data)
+
+                if cache_key not in converter_cache:
+                    converter = rule._converters[data]
+
+                    try:
+                        converter_cache[cache_key] = (True, converter.to_url(raw))
+                    except Exception as e:
+                        converter_cache[cache_key] = (False, e)
+
+                ok, converted = converter_cache[cache_key]
+
+                if not ok:
+                    errors[data] = (raw, converted)
+                else:
+                    parts.append(converted)
+            else:
+                # safe = https://url.spec.whatwg.org/#url-path-segment-string
+                parts.append(quote(data, safe="!$&'()*+,/:;=@"))
+
+        if errors:
+            return None, errors
+
+        domain = "".join(dom_parts)
+        path = "".join(url_parts)
+
+        if append_unknown:
+            remaining = {k: v for k, v in values.items() if k not in rule.arguments}
+            params = rule._encode_query_vars(remaining)
+
+            if params:
+                path = f"{path}?{params}"
+
+        return (domain, path), errors
