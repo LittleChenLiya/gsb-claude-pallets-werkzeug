@@ -124,6 +124,9 @@ from .exceptions import WebsocketMismatch as WebsocketMismatch
 from .map import Map as Map
 from .map import MapAdapter as MapAdapter
 from .matcher import StateMachineMatcher as StateMachineMatcher
+from .roundtrip import check_roundtrip as check_roundtrip
+from .roundtrip import RoundTripFailure as RoundTripFailure
+from .roundtrip import RoundTripReport as RoundTripReport
 from .rules import EndpointPrefix as EndpointPrefix
 from .rules import parse_converter_args as parse_converter_args
 from .rules import Rule as Rule

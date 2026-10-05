@@ -146,6 +146,47 @@ converters can be overridden or extended through :attr:`Map.converters`.
 .. autoclass:: UUIDConverter
 
 
+Converter Round-Trip Checking
+=============================
+
+.. currentmodule:: werkzeug.routing
+
+For a *finite* set of sample values, :func:`check_roundtrip` verifies
+that a rule's converters preserve the identity of each sample through
+``to_url`` followed by ``to_python``. The encoded segment must not
+cross a path segment and must still match the original rule. Failures
+are reported separately per direction (``to_url``, ``segment``,
+``to_python``, ``match``, ``compare``), and view functions are never
+called.
+
+Only the provided samples are checked: a passing report does **not**
+claim the converter round-trips for every possible value.
+
+.. code-block:: python
+
+    class BadIntConverter(IntegerConverter):
+        def to_url(self, value):
+            return f"{int(value)}/extra"  # crosses a path segment
+
+    rule = Rule("/item/<bad:n>", endpoint="item")
+    Map([rule], converters={"bad": BadIntConverter})
+    report = check_roundtrip(rule, list(range(12)))
+    assert not report.ok  # 12 "segment" failures
+    print(report.summary())
+
+The checker's tests can be run on their own with::
+
+    python -m pytest tests/test_routing_roundtrip.py -q
+
+.. autofunction:: check_roundtrip
+
+.. autoclass:: RoundTripReport
+   :members:
+
+.. autoclass:: RoundTripFailure
+   :members:
+
+
 Maps, Rules and Adapters
 ========================
 

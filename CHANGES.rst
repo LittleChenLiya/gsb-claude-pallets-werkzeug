@@ -27,6 +27,13 @@ Version 3.2.0
         deprecated. Type converting ``get`` is still available on ``MultiDict``
         and ``ImmutableMultiDict``.
 
+-   Add ``werkzeug.routing.check_roundtrip``, an explicit round-trip checker
+    that verifies, for a finite set of sample values, that a rule's converters
+    preserve identity through ``to_url`` followed by ``to_python``. The encoded
+    segment must still match the original rule and must not cross path
+    segments, failures are reported separately per direction, and view
+    functions are never called. The report states the finite guarantee: only
+    the checked samples are covered, no universal equivalence is claimed.
 -   All structured header classes in ``werkzeug.datastructures`` have a
     ``from_header`` class method, and a ``to_header`` method. Corresponding
     parsing functions in ``werkzeug.http`` are deprecated: ``dump_csp_header``,
