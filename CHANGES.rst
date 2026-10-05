@@ -227,6 +227,15 @@ Version 3.2.0
 -   ``SharedDataMiddleware`` uses ``send_file``. ``cache_timeout`` is not set by
     default, enabling conditional caching. `` The ``cache`` and
     ``fallback_mimetype`` parameters are deprecated. :issue:`3291`
+-   Add ``read_contract`` and ``MultiDict.read_contract`` with ``Field``
+    declarations for explicit query parameter parsing: single vs. multi value
+    per key, required keys, and a converter called once per occurrence. A
+    repeated single value key is rejected instead of taking the first value,
+    missing keys, empty strings, and ``None`` values follow separate
+    strategies (``EmptyPolicy`` and ``NullPolicy``), and either every field
+    passes or a ``ContractError`` listing every ``FieldError`` (key and
+    occurrence index) is raised with no partial result. The source
+    ``MultiDict`` is not modified and ``get`` behavior is unchanged.
 
 
 Version 3.1.9

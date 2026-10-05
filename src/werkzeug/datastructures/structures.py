@@ -13,6 +13,8 @@ from .mixins import ImmutableMultiDictMixin
 if t.TYPE_CHECKING:
     import typing_extensions as te
 
+    from .contract import Field
+
 K = t.TypeVar("K")
 V = t.TypeVar("V")
 T = t.TypeVar("T")
@@ -332,6 +334,25 @@ class MultiDict(dict[K, V]):
             except (ValueError, TypeError):
                 pass
         return result
+
+    def read_contract(
+        self,
+        fields: (cabc.Mapping[t.Any, Field[V, t.Any]] | cabc.Iterable[Field[V, t.Any]]),
+    ) -> dict[t.Any, t.Any]:
+        """Validate and convert values using an explicit contract.
+
+        Unlike :meth:`get`, which silently takes the first occurrence of a
+        repeated key and falls back to a default when conversion fails,
+        this reads every declared :class:`~werkzeug.datastructures.Field`
+        and returns a result only when all of them pass. See
+        :func:`werkzeug.datastructures.read_contract` for details. The
+        regular :meth:`get` behaviour is unchanged.
+
+        .. versionadded:: 3.2
+        """
+        from .contract import read_contract
+
+        return read_contract(self, fields)
 
     def setlist(self, key: K, new_list: cabc.Iterable[V]) -> None:
         """Remove the old values for a key and add new ones.  Note that the list

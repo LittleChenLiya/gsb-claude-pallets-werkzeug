@@ -14,6 +14,71 @@ MultiDict
 .. autoclass:: CombinedMultiDict
 
 
+Contract-based reading
+----------------------
+
+.. versionadded:: 3.2
+
+:meth:`MultiDict.get` silently takes the first occurrence of a repeated
+key and falls back to a default when conversion fails. When the query
+parameters are an explicit input contract, use
+:func:`read_contract` (also available as :meth:`MultiDict.read_contract`)
+with a :class:`Field` per key instead:
+
+.. code-block:: python
+
+    from werkzeug.datastructures import Field, read_contract
+
+    result = read_contract(
+        request.args,
+        [
+            Field("page", converter=int),
+            Field("tag", multi=True, required=False),
+            Field("size", required=False, converter=int, default=10),
+        ],
+    )
+
+Rules enforced per field:
+
+-   A single value field (``multi=False``) rejects a repeated key with an
+    :attr:`ErrorKind.DUPLICATE` error instead of returning the first value.
+-   A multi value field (``multi=True``) returns all occurrences in order.
+-   Every ordinary occurrence calls ``converter`` exactly once; a
+    :class:`ValueError` or :class:`TypeError` records an
+    :attr:`ErrorKind.CONVERT` error.
+-   Missing keys, empty strings and actual ``None`` values are separate
+    cases. Missing required keys report :attr:`ErrorKind.MISSING`; empty
+    strings follow :class:`EmptyPolicy`; ``None`` values follow
+    :class:`NullPolicy`.
+-   All fields are checked. The result is returned only when everything
+    passes; otherwise a :class:`ContractError` with every
+    :class:`FieldError` (key, occurrence index and raw value) is raised,
+    so no partial result is observable.
+-   The source :class:`MultiDict` is never modified, and keys without a
+    declared field are ignored. The existing :meth:`MultiDict.get`
+    behavior is unchanged.
+
+.. autofunction:: read_contract
+
+.. autoclass:: Field
+    :members:
+
+.. autoclass:: ContractError
+    :members:
+
+.. autoclass:: FieldError
+    :members:
+
+.. autoclass:: EmptyPolicy
+    :members:
+
+.. autoclass:: NullPolicy
+    :members:
+
+.. autoclass:: ErrorKind
+    :members:
+
+
 .. _http-datastructures:
 
 HTTP Headers
