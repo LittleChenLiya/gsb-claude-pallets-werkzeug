@@ -371,6 +371,164 @@ class TestMultiDict(_MutableMultiDictTests):
         with pytest.raises(KeyError):
             md["empty"]
 
+    def test_get_contract_three_params(self):
+        # Three-parameter example: a required single page, a multi-value
+        # tag, and an optional single limit with a default.
+        md = self.storage_class(
+            [("page", "2"), ("tag", "a"), ("tag", "b"), ("limit", "10")]
+        )
+        assert md.get_contract(
+            {
+                "page": ds.Param(int, required=True),
+                "tag": ds.Param(str, multi=True),
+                "limit": ds.Param(int, default=20),
+            }
+        ) == {"page": 2, "tag": ["a", "b"], "limit": 10}
+
+    def test_get_contract_multi_keeps_order(self):
+        md = self.storage_class([("tag", "b"), ("tag", "a"), ("tag", "c")])
+        assert md.get_contract({"tag": ds.Param(str, multi=True)}) == {
+            "tag": ["b", "a", "c"]
+        }
+
+    def test_get_contract_rejects_repeated_single(self):
+        # A single-value key given twice is rejected, not silently read
+        # as the first value.
+        md = self.storage_class([("page", "1"), ("page", "2")])
+        with pytest.raises(ds.RepeatedValueError) as exc_info:
+            md.get_contract({"page": ds.Param(int, required=True)})
+        err = exc_info.value
+        assert err.key == "page"
+        assert err.values == ["1", "2"]
+
+    def test_get_contract_invalid_value_returns_no_half_result(self):
+        # page=bad must fail the whole read; the valid tag must not be
+        # returned as a partial result.
+        md = self.storage_class([("page", "bad"), ("tag", "x"), ("tag", "y")])
+        with pytest.raises(ds.InvalidValueError) as exc_info:
+            md.get_contract(
+                {
+                    "page": ds.Param(int, required=True),
+                    "tag": ds.Param(str, multi=True),
+                }
+            )
+        err = exc_info.value
+        assert err.key == "page"
+        assert err.index == 0
+        assert err.value == "bad"
+        assert err.type is int
+
+    def test_get_contract_invalid_multi_value_carries_index(self):
+        # The failing occurrence's index is preserved.
+        md = self.storage_class([("tag", "1"), ("tag", "bad"), ("tag", "3")])
+        with pytest.raises(ds.InvalidValueError) as exc_info:
+            md.get_contract({"tag": ds.Param(int, multi=True)})
+        err = exc_info.value
+        assert err.key == "tag"
+        assert err.index == 1
+        assert err.value == "bad"
+
+    def test_get_contract_empty_string_is_converted(self):
+        # An empty string is a present value, not a missing key: it is
+        # passed to the converter (which rejects it for int).
+        md = self.storage_class([("page", "")])
+        with pytest.raises(ds.InvalidValueError) as exc_info:
+            md.get_contract({"page": ds.Param(int, required=True)})
+        err = exc_info.value
+        assert err.key == "page"
+        assert err.index == 0
+        assert err.value == ""
+
+    def test_get_contract_empty_string_is_not_default(self):
+        # With a converter that accepts empty strings, the empty string
+        # is returned rather than the default.
+        md = self.storage_class([("page", "")])
+        assert md.get_contract({"page": ds.Param(str, default="x")}) == {"page": ""}
+
+    def test_get_contract_missing_required(self):
+        md = self.storage_class()
+        with pytest.raises(ds.MissingValueError) as exc_info:
+            md.get_contract({"page": ds.Param(int, required=True)})
+        assert exc_info.value.key == "page"
+
+    def test_get_contract_missing_optional_uses_default(self):
+        md = self.storage_class()
+        assert md.get_contract({"page": ds.Param(int, default=5)}) == {"page": 5}
+
+    def test_get_contract_default_is_not_converted(self):
+        # The default is used as-is; the converter is never called for a
+        # missing key.
+        calls = []
+
+        def convert(value):
+            calls.append(value)
+            return int(value)
+
+        md = self.storage_class()
+        assert md.get_contract({"page": ds.Param(convert, default=5)}) == {"page": 5}
+        assert calls == []
+
+    def test_get_contract_null_passes_through(self):
+        # A present None value passes through without invoking the
+        # converter, distinct from an empty string and a missing key.
+        calls = []
+
+        def convert(value):
+            calls.append(value)
+            return int(value)
+
+        md = self.storage_class([("page", None)])
+        assert md.get_contract({"page": ds.Param(convert, required=True)}) == {
+            "page": None
+        }
+        assert calls == []
+
+    def test_get_contract_converter_called_once_per_item(self):
+        calls = []
+
+        def convert(value):
+            calls.append(value)
+            return int(value)
+
+        md = self.storage_class([("tag", "1"), ("tag", "2"), ("tag", "3")])
+        assert md.get_contract({"tag": ds.Param(convert, multi=True)}) == {
+            "tag": [1, 2, 3]
+        }
+        assert calls == ["1", "2", "3"]
+
+    def test_get_contract_does_not_modify_multidict(self):
+        md = self.storage_class(
+            [("page", "2"), ("tag", "a"), ("tag", "b"), ("page", "3")]
+        )
+        before = list(md.items(multi=True))
+        with pytest.raises(ds.RepeatedValueError):
+            md.get_contract(
+                {
+                    "page": ds.Param(int, required=True),
+                    "tag": ds.Param(str, multi=True),
+                }
+            )
+        assert list(md.items(multi=True)) == before
+
+    def test_get_contract_only_returns_declared_keys(self):
+        md = self.storage_class([("page", "2"), ("extra", "x")])
+        assert md.get_contract({"page": ds.Param(int, required=True)}) == {"page": 2}
+
+    def test_get_contract_accepts_either_error_type(self):
+        # Both ValueError and TypeError from the converter are wrapped.
+        md = self.storage_class([("page", "1")])
+        with pytest.raises(ds.InvalidValueError):
+            md.get_contract({"page": ds.Param(lambda v: v + None, required=True)})
+
+    def test_get_contract_get_behavior_unchanged(self):
+        # The plain get/getlist behavior is unaffected by the contract
+        # API.
+        md = self.storage_class([("a", "1"), ("a", "2")])
+        assert md.get("a") == "1"
+        assert md.get("missing") is None
+        assert md.getlist("a", type=int) == [1, 2]
+        assert md.getlist("missing") == []
+
 
 class TestCombinedMultiDict:
     storage_class = ds.CombinedMultiDict

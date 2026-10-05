@@ -139,6 +139,121 @@ class _ImmutableTypeConversionDict(  # type: ignore[misc]
         return self
 
 
+class ContractError(ValueError):
+    """Base class for errors raised by :meth:`MultiDict.get_contract`.
+
+    Every contract error carries the :attr:`key` of the offending
+    parameter.
+
+    .. versionadded:: 3.2
+    """
+
+    def __init__(self, key: K, message: str) -> None:
+        self.key = key
+        super().__init__(message)
+
+
+class MissingValueError(ContractError):
+    """A required parameter was not present in the :class:`MultiDict`.
+
+    .. versionadded:: 3.2
+    """
+
+    def __init__(self, key: K) -> None:
+        super().__init__(key, f"Missing required parameter {key!r}.")
+
+
+class RepeatedValueError(ContractError):
+    """A parameter declared as a single value was given more than once.
+
+    Unlike :meth:`MultiDict.get`, which silently returns the first value,
+    contract reading rejects the repetition.
+
+    .. versionadded:: 3.2
+    """
+
+    def __init__(self, key: K, values: cabc.Sequence[V]) -> None:
+        self.values = list(values)
+        super().__init__(
+            key,
+            f"Parameter {key!r} is declared as a single value but was given "
+            f"{len(self.values)} times.",
+        )
+
+
+class InvalidValueError(ContractError):
+    """A present value could not be converted to the declared type.
+
+    The :attr:`index` is the zero-based occurrence of the value within
+    the parameter's value list, so the offending occurrence can be
+    located.
+
+    .. versionadded:: 3.2
+    """
+
+    def __init__(
+        self, key: K, index: int, value: V, type: cabc.Callable[[V], T]
+    ) -> None:
+        self.index = index
+        self.value = value
+        self.type = type
+        type_name = getattr(type, "__name__", repr(type))
+        super().__init__(
+            key,
+            f"Invalid value for parameter {key!r} at index {index}: "
+            f"{value!r} is not a valid {type_name}.",
+        )
+
+
+class Param:
+    """Explicit contract for a single :class:`MultiDict` parameter.
+
+    A contract declares whether a parameter is a single value or a list
+    of values, whether it is required, and how each present value is
+    converted. It is read with :meth:`MultiDict.get_contract`::
+
+        >>> d = MultiDict([("page", "2"), ("tag", "a"), ("tag", "b")])
+        >>> d.get_contract(
+        ...     {"page": Param(int, required=True), "tag": Param(str, multi=True)}
+        ... )
+        {'page': 2, 'tag': ['a', 'b']}
+
+    :param type: Callable used to convert each present value. It is called
+        once per value. If it raises :exc:`ValueError` or
+        :exc:`TypeError`, :class:`InvalidValueError` is raised.
+    :param required: If ``True`` and the key is not present,
+        :class:`MissingValueError` is raised.
+    :param default: Value returned when the key is not present and
+        ``required`` is ``False``.
+    :param multi: If ``True``, all values are converted and returned as a
+        list, preserving order. If ``False``, more than one value for the
+        key is rejected with :class:`RepeatedValueError`.
+
+    .. versionadded:: 3.2
+    """
+
+    __slots__ = ("type", "required", "default", "multi")
+
+    def __init__(
+        self,
+        type: cabc.Callable[[V], T] = str,
+        *,
+        required: bool = False,
+        default: T | None = None,
+        multi: bool = False,
+    ) -> None:
+        self.type = type
+        self.required = required
+        self.default = default
+        self.multi = multi
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(type={self.type!r}, required={self.required!r},"
+            f" default={self.default!r}, multi={self.multi!r})"
+        )
+
+
 class MultiDict(dict[K, V]):
     """A :class:`MultiDict` is a dictionary subclass customized to deal with
     multiple values for the same key which is for example used by the parsing
@@ -332,6 +447,101 @@ class MultiDict(dict[K, V]):
             except (ValueError, TypeError):
                 pass
         return result
+
+    def get_contract(self, contract: cabc.Mapping[K, Param]) -> dict[K, t.Any]:
+        """Read query parameters against an explicit contract.
+
+        Unlike :meth:`get` and :meth:`getlist`, which silently fall back
+        to defaults or drop values that fail conversion, this method
+        validates every declared parameter before returning. A parameter
+        declared as a single value that is given more than once is
+        rejected rather than silently taking the first value. All
+        conversions must succeed; if any fails, an error is raised and no
+        partial result is returned. The original :class:`MultiDict` is
+        never modified.
+
+        Empty strings, missing keys, and ``None`` values are handled by
+        distinct strategies:
+
+        - An empty string is a present value and is passed to the
+          converter (which may reject it).
+        - A missing key raises :class:`MissingValueError` if required,
+          otherwise the contract's default is used.
+        - A ``None`` value is present but null: it is passed through
+          without invoking the converter, distinct from both an empty
+          string and a missing key.
+
+        Each present value is converted exactly once. Errors carry the
+        offending key and, for conversion errors, the zero-based
+        occurrence index of the value.
+
+        >>> d = MultiDict(
+        ...     [("page", "2"), ("tag", "a"), ("tag", "b"), ("limit", "10")]
+        ... )
+        >>> d.get_contract(
+        ...     {
+        ...         "page": Param(int, required=True),
+        ...         "tag": Param(str, multi=True),
+        ...         "limit": Param(int, default=20),
+        ...     }
+        ... )
+        {'page': 2, 'tag': ['a', 'b'], 'limit': 10}
+
+        :param contract: A mapping of keys to :class:`Param` declarations.
+        :return: A mapping of keys to converted values (or lists of values
+            for multi parameters).
+        :raise MissingValueError: if a required key is not present.
+        :raise RepeatedValueError: if a single-value key is given more
+            than once.
+        :raise InvalidValueError: if a value fails to convert.
+
+        .. versionadded:: 3.2
+        """
+        result: dict[K, t.Any] = {}
+
+        for key, param in contract.items():
+            values = self.getlist(key)
+
+            if not values:
+                if param.required:
+                    raise MissingValueError(key)
+
+                result[key] = param.default
+                continue
+
+            if not param.multi:
+                if len(values) > 1:
+                    raise RepeatedValueError(key, values)
+
+                result[key] = self._convert_contract_value(
+                    key, 0, values[0], param.type
+                )
+                continue
+
+            result[key] = [
+                self._convert_contract_value(key, index, value, param.type)
+                for index, value in enumerate(values)
+            ]
+
+        return result
+
+    @staticmethod
+    def _convert_contract_value(
+        key: K,
+        index: int,
+        value: V,
+        type: cabc.Callable[[V], T],
+    ) -> T:
+        # A ``None`` value is present but null. It is passed through
+        # without invoking the converter, distinct from an empty string
+        # (which is converted) and a missing key (which uses the default).
+        if value is None:
+            return None  # type: ignore[return-value]
+
+        try:
+            return type(value)
+        except (ValueError, TypeError) as exc:
+            raise InvalidValueError(key, index, value, type) from exc
 
     def setlist(self, key: K, new_list: cabc.Iterable[V]) -> None:
         """Remove the old values for a key and add new ones.  Note that the list
